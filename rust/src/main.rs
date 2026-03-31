@@ -102,7 +102,11 @@ fn main() {
 
     eprintln!("Mounted at {}", cli.mountpoint);
 
-    fuser::mount2(fs, &cli.mountpoint, &[]).unwrap_or_else(|e| {
+    let mut config = fuser::Config::default();
+    config.n_threads = Some(4);
+    config.clone_fd = true;
+
+    fuser::mount2(fs, &cli.mountpoint, &config).unwrap_or_else(|e| {
         eprintln!("Error mounting filesystem: {}", e);
         std::process::exit(1);
     });

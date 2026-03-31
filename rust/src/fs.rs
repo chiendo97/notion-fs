@@ -7,20 +7,20 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen,
-    Request,
+    Errno, FileAttr, FileHandle, FileType, FopenFlags, Filesystem, Generation, INodeNo,
+    LockOwner, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request,
 };
-
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cache::{NotionCache, Tree};
 
 const TTL: Duration = Duration::from_secs(1);
-const ROOT_INO: u64 = 1;
+const ROOT_INO: INodeNo = INodeNo(1);
+const GENERATION: Generation = Generation(0);
 const BLOCK_SIZE: u32 = 512;
 
 /// Deterministic inode from path. Uses a hash, reserving 1 for root.
-fn path_to_ino(path: &PathBuf) -> u64 {
+fn path_to_ino(path: &PathBuf) -> INodeNo {
     if path.as_os_str() == "/" {
         return ROOT_INO;
     }
@@ -28,15 +28,14 @@ fn path_to_ino(path: &PathBuf) -> u64 {
     path.hash(&mut hasher);
     let h = hasher.finish();
     // Avoid collisions with ROOT_INO (1) and 0
-    if h <= 1 { h + 2 } else { h }
+    INodeNo(if h <= 1 { h + 2 } else { h })
 }
 
 pub struct NotionFS {
     cache: Arc<NotionCache>,
     rendered: Mutex<HashMap<String, Vec<u8>>>,
     refresh_buf: Mutex<HashMap<String, Vec<u8>>>,
-    // Reverse map: inode -> path (for getattr/read which only receive an inode)
-    ino_to_path: RwLock<HashMap<u64, PathBuf>>,
+    ino_to_path: RwLock<HashMap<INodeNo, PathBuf>>,
     uid: u32,
     gid: u32,
 }
@@ -57,17 +56,14 @@ impl NotionFS {
         }
     }
 
-    /// Register a path in the reverse inode map (if not already present).
-    fn register_ino(&self, path: &PathBuf) -> u64 {
+    fn register_ino(&self, path: &PathBuf) -> INodeNo {
         let ino = path_to_ino(path);
-        // Fast path: check read lock first
         {
             let map = self.ino_to_path.read().unwrap();
             if map.contains_key(&ino) {
                 return ino;
             }
         }
-        // Slow path: insert under write lock
         self.ino_to_path
             .write()
             .unwrap()
@@ -75,12 +71,10 @@ impl NotionFS {
         ino
     }
 
-    /// Look up the path for an inode.
-    fn get_path(&self, ino: u64) -> Option<PathBuf> {
+    fn get_path(&self, ino: INodeNo) -> Option<PathBuf> {
         self.ino_to_path.read().unwrap().get(&ino).cloned()
     }
 
-    /// Split a path into its non-empty components.
     fn path_parts(path: &PathBuf) -> Vec<String> {
         path.components()
             .filter_map(|c| match c {
@@ -90,7 +84,7 @@ impl NotionFS {
             .collect()
     }
 
-    fn dir_attr(&self, ino: u64) -> FileAttr {
+    fn dir_attr(&self, ino: INodeNo) -> FileAttr {
         let now = SystemTime::now();
         FileAttr {
             ino,
@@ -111,7 +105,7 @@ impl NotionFS {
         }
     }
 
-    fn file_attr(&self, ino: u64) -> FileAttr {
+    fn file_attr(&self, ino: INodeNo) -> FileAttr {
         let now = SystemTime::now();
         FileAttr {
             ino,
@@ -132,18 +126,16 @@ impl NotionFS {
         }
     }
 
-    /// Determine whether a path is a directory or file based on depth.
     fn is_dir(parts: &[String]) -> bool {
         match parts.len() {
-            0 => true,  // root
-            1 => true,  // project
-            2 => parts[1] != ".refresh", // ".refresh" is a file
-            3 => true,  // status
-            _ => false, // ticket file at depth 4+
+            0 => true,
+            1 => true,
+            2 => parts[1] != ".refresh",
+            3 => true,
+            _ => false,
         }
     }
 
-    /// Check whether the path exists in the tree.
     fn path_exists_in(tree: &Tree, parts: &[String]) -> bool {
         match parts.len() {
             0 => true,
@@ -153,13 +145,13 @@ impl NotionFS {
                     return tree.contains_key(&parts[0]);
                 }
                 tree.get(&parts[0])
-                    .map(|assignees| assignees.contains_key(&parts[1]))
+                    .map(|a| a.contains_key(&parts[1]))
                     .unwrap_or(false)
             }
             3 => tree
                 .get(&parts[0])
                 .and_then(|a| a.get(&parts[1]))
-                .map(|statuses| statuses.contains_key(&parts[2]))
+                .map(|s| s.contains_key(&parts[2]))
                 .unwrap_or(false),
             4 => tree
                 .get(&parts[0])
@@ -177,11 +169,11 @@ impl NotionFS {
 }
 
 impl Filesystem for NotionFS {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let parent_path = match self.get_path(parent) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -189,7 +181,7 @@ impl Filesystem for NotionFS {
         let child_name = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -199,7 +191,7 @@ impl Filesystem for NotionFS {
         let tree = self.cache.get_tree();
 
         if !Self::path_exists_in(&tree, &parts) {
-            reply.error(libc::ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         }
 
@@ -210,14 +202,14 @@ impl Filesystem for NotionFS {
             self.file_attr(ino)
         };
 
-        reply.entry(&TTL, &attr, 0);
+        reply.entry(&TTL, &attr, GENERATION);
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let path = match self.get_path(ino) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -226,7 +218,7 @@ impl Filesystem for NotionFS {
         let tree = self.cache.get_tree();
 
         if !Self::path_exists_in(&tree, &parts) {
-            reply.error(libc::ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         }
 
@@ -240,17 +232,17 @@ impl Filesystem for NotionFS {
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let path = match self.get_path(ino) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -258,7 +250,6 @@ impl Filesystem for NotionFS {
         let parts = Self::path_parts(&path);
         let tree = self.cache.get_tree();
 
-        // Collect entries: (name, file_type)
         let mut entries: Vec<(String, FileType)> = vec![
             (".".to_string(), FileType::Directory),
             ("..".to_string(), FileType::Directory),
@@ -300,16 +291,14 @@ impl Filesystem for NotionFS {
                 }
             }
             _ => {
-                reply.error(libc::ENOTDIR);
+                reply.error(Errno::ENOTDIR);
                 return;
             }
         }
 
-        // Sort entries after "." and ".." for stable output
         entries[2..].sort_by(|a, b| a.0.cmp(&b.0));
 
-        // Batch-register inodes: collect all child paths, then insert under a single write lock
-        let child_paths: Vec<(PathBuf, u64)> = entries
+        let child_paths: Vec<(PathBuf, INodeNo)> = entries
             .iter()
             .map(|(name, _)| {
                 let cp = if name == "." {
@@ -324,11 +313,10 @@ impl Filesystem for NotionFS {
             })
             .collect();
 
-        // Single write lock for all new inodes
         {
             let mut map = self.ino_to_path.write().unwrap();
             for (cp, ino) in &child_paths {
-                map.entry(*ino).or_insert_with(|| cp.clone());
+                map.entry(*ino).or_insert(cp.clone());
             }
         }
 
@@ -338,7 +326,7 @@ impl Filesystem for NotionFS {
             .enumerate()
             .skip(offset as usize)
         {
-            if reply.add(*child_ino, (i + 1) as i64, *file_type, &entries[i].0) {
+            if reply.add(*child_ino, (i + 1) as u64, *file_type, &entries[i].0) {
                 break;
             }
         }
@@ -346,30 +334,30 @@ impl Filesystem for NotionFS {
         reply.ok();
     }
 
-    fn open(&mut self, _req: &Request, _ino: u64, flags: i32, reply: ReplyOpen) {
-        let access_mode = flags & libc::O_ACCMODE;
+    fn open(&self, _req: &Request, _ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
+        let access_mode = flags.0 & libc::O_ACCMODE;
         if access_mode != libc::O_RDONLY {
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
             return;
         }
-        reply.opened(0, 0);
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
         let path = match self.get_path(ino) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -378,7 +366,7 @@ impl Filesystem for NotionFS {
         let offset = offset as usize;
         let size = size as usize;
 
-        // .refresh file: project/.refresh
+        // .refresh file
         if parts.len() == 2 && parts[1] == ".refresh" {
             let proj_slug = &parts[0];
 
@@ -404,13 +392,18 @@ impl Filesystem for NotionFS {
                 let msg = format!("Refreshed {}: {} tickets\n", display_name, count);
                 let msg_bytes = msg.into_bytes();
 
-                self.cache.save_project_cache(proj_slug);
                 self.refresh_buf
                     .lock()
                     .unwrap()
                     .insert(proj_slug.to_string(), msg_bytes);
 
                 self.rendered.lock().unwrap().clear();
+
+                let cache = self.cache.clone();
+                let slug = proj_slug.to_string();
+                std::thread::spawn(move || {
+                    cache.save_project_cache(&slug);
+                });
             }
 
             let buf = self.refresh_buf.lock().unwrap();
@@ -427,7 +420,7 @@ impl Filesystem for NotionFS {
             return;
         }
 
-        // Ticket file: project/assignee/status/TICKET-ID.md
+        // Ticket file
         if parts.len() == 4 {
             let (proj, assignee, status, filename) = (&parts[0], &parts[1], &parts[2], &parts[3]);
 
@@ -453,9 +446,7 @@ impl Filesystem for NotionFS {
                     } else {
                         if ticket.description.is_empty() {
                             match self.cache.fetch_description(&page_id) {
-                                Ok(desc) => {
-                                    ticket.description = desc;
-                                }
+                                Ok(desc) => ticket.description = desc,
                                 Err(e) => {
                                     eprintln!(
                                         "Failed to fetch description for {}: {}",
@@ -480,39 +471,37 @@ impl Filesystem for NotionFS {
                         reply.data(&data[offset..end]);
                     }
                 }
-                None => {
-                    reply.error(libc::ENOENT);
-                }
+                None => reply.error(Errno::ENOENT),
             }
             return;
         }
 
-        reply.error(libc::ENOENT);
+        reply.error(Errno::ENOENT);
     }
 
     // -----------------------------------------------------------------------
-    // Read-only stubs — all reject with EROFS
+    // Read-only stubs
     // -----------------------------------------------------------------------
 
     fn write(
-        &mut self,
+        &self,
         _req: &Request,
-        _ino: u64,
-        _fh: u64,
-        _offset: i64,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _offset: u64,
         _data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: fuser::WriteFlags,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
-        reply.error(libc::EROFS);
+        reply.error(Errno::EROFS);
     }
 
     fn setattr(
-        &mut self,
+        &self,
         _req: &Request,
-        _ino: u64,
+        _ino: INodeNo,
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
@@ -520,94 +509,94 @@ impl Filesystem for NotionFS {
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        reply.error(libc::EROFS);
+        reply.error(Errno::EROFS);
     }
 
     fn mkdir(
-        &mut self,
+        &self,
         _req: &Request,
-        _parent: u64,
+        _parent: INodeNo,
         _name: &OsStr,
         _mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        reply.error(libc::EROFS);
+        reply.error(Errno::EROFS);
     }
 
-    fn rmdir(&mut self, _req: &Request, _parent: u64, _name: &OsStr, reply: fuser::ReplyEmpty) {
-        reply.error(libc::EROFS);
+    fn rmdir(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: fuser::ReplyEmpty) {
+        reply.error(Errno::EROFS);
     }
 
-    fn unlink(&mut self, _req: &Request, _parent: u64, _name: &OsStr, reply: fuser::ReplyEmpty) {
-        reply.error(libc::EROFS);
+    fn unlink(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: fuser::ReplyEmpty) {
+        reply.error(Errno::EROFS);
     }
 
     fn rename(
-        &mut self,
+        &self,
         _req: &Request,
-        _parent: u64,
+        _parent: INodeNo,
         _name: &OsStr,
-        _newparent: u64,
+        _newparent: INodeNo,
         _newname: &OsStr,
-        _flags: u32,
+        _flags: fuser::RenameFlags,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.error(libc::EROFS);
+        reply.error(Errno::EROFS);
     }
 
     fn create(
-        &mut self,
+        &self,
         _req: &Request,
-        _parent: u64,
+        _parent: INodeNo,
         _name: &OsStr,
         _mode: u32,
         _umask: u32,
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
-        reply.error(libc::EROFS);
+        reply.error(Errno::EROFS);
     }
 
     fn mknod(
-        &mut self,
+        &self,
         _req: &Request,
-        _parent: u64,
+        _parent: INodeNo,
         _name: &OsStr,
         _mode: u32,
         _umask: u32,
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        reply.error(libc::EROFS);
+        reply.error(Errno::EROFS);
     }
 
     fn symlink(
-        &mut self,
+        &self,
         _req: &Request,
-        _parent: u64,
+        _parent: INodeNo,
         _link_name: &OsStr,
         _target: &std::path::Path,
         reply: ReplyEntry,
     ) {
-        reply.error(libc::EROFS);
+        reply.error(Errno::EROFS);
     }
 
     fn link(
-        &mut self,
+        &self,
         _req: &Request,
-        _ino: u64,
-        _newparent: u64,
+        _ino: INodeNo,
+        _newparent: INodeNo,
         _newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        reply.error(libc::EROFS);
+        reply.error(Errno::EROFS);
     }
 }
