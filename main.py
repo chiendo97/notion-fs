@@ -276,9 +276,12 @@ class Ticket(BaseModel):
         if self.page_id:
             self.description = _read_page_content(self.page_id)
 
-    def render(self) -> bytes:
+    def render(self) -> tuple[bytes, bool]:
+        """Render ticket as markdown. Returns (content, description_was_fetched)."""
+        fetched = False
         if not self.description and self.page_id:
             self.fetch_description()
+            fetched = True
         ah_str = str(self.ah) if self.ah is not None else ""
         created_short = self.created[:10] if self.created else ""
         edited_short = self.edited[:10] if self.edited else ""
@@ -298,7 +301,7 @@ class Ticket(BaseModel):
             self.description,
             "",
         ]
-        return "\n".join(lines).encode("utf-8")
+        return "\n".join(lines).encode("utf-8"), fetched
 
 
 # =============================================================================
@@ -318,17 +321,72 @@ Tree = dict[str, dict[str, dict[str, list[Ticket]]]]
 
 
 class NotionCache:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, cache_dir: Path | None = None) -> None:
         self.config = config
         self.tree: Tree = {}
         self.slug_map: dict[str, str] = {}
         self._lock = threading.Lock()
+        self._cache_dir = cache_dir
         self._user_id_to_name: dict[str, str] = {
             uid: name for name, uid in config.users.items()
         }
+        if cache_dir:
+            cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _resolve_assignee(self, ticket: Ticket) -> str:
         return ticket.assignee if ticket.assignee else "unassigned"
+
+    def _cache_path(self, proj_slug: str) -> Path | None:
+        if not self._cache_dir:
+            return None
+        return self._cache_dir / f"{proj_slug}.json"
+
+    def _save_cache(self, proj_slug: str, tickets: list[Ticket]) -> None:
+        path = self._cache_path(proj_slug)
+        if not path:
+            return
+        data = [t.model_dump() for t in tickets]
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def _load_cache(self, proj_slug: str) -> list[Ticket] | None:
+        path = self._cache_path(proj_slug)
+        if not path or not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return [Ticket.model_validate(d) for d in data]
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def load_from_disk(self) -> int:
+        total = 0
+        new_tree: Tree = {}
+        new_slug_map: dict[str, str] = {}
+        for proj_name in self.config.projects:
+            proj_slug = slugify(proj_name)
+            tickets = self._load_cache(proj_slug)
+            if tickets is None:
+                continue
+            new_slug_map[proj_slug] = proj_name
+            assignee_dict: dict[str, dict[str, list[Ticket]]] = {}
+            for ticket in tickets:
+                total += 1
+                assignee_display = self._resolve_assignee(ticket)
+                assignee_slug = slugify(assignee_display)
+                new_slug_map[assignee_slug] = assignee_display
+                status_display = ticket.status or "no-status"
+                status_slug = slugify(status_display)
+                new_slug_map[status_slug] = status_display
+                if assignee_slug not in assignee_dict:
+                    assignee_dict[assignee_slug] = {}
+                if status_slug not in assignee_dict[assignee_slug]:
+                    assignee_dict[assignee_slug][status_slug] = []
+                assignee_dict[assignee_slug][status_slug].append(ticket)
+            new_tree[proj_slug] = assignee_dict
+        with self._lock:
+            self.tree.update(new_tree)
+            self.slug_map.update(new_slug_map)
+        return total
 
     def refresh(self, project: str | None = None) -> int:
         projects = [project] if project else list(self.config.projects.keys())
@@ -345,10 +403,12 @@ class NotionCache:
             proj_slug = slugify(proj_name)
             new_slug_map[proj_slug] = proj_name
             assignee_dict: dict[str, dict[str, list[Ticket]]] = {}
+            all_tickets: list[Ticket] = []
 
             for page in pages:
                 ticket = Ticket.from_page(page)
                 total += 1
+                all_tickets.append(ticket)
 
                 assignee_display = self._resolve_assignee(ticket)
                 assignee_slug = slugify(assignee_display)
@@ -365,6 +425,7 @@ class NotionCache:
                 assignee_dict[assignee_slug][status_slug].append(ticket)
 
             new_tree[proj_slug] = assignee_dict
+            self._save_cache(proj_slug, all_tickets)
 
         with self._lock:
             for proj_slug, assignee_dict in new_tree.items():
@@ -372,6 +433,12 @@ class NotionCache:
             self.slug_map.update(new_slug_map)
 
         return total
+
+    def save_project_cache(self, proj_slug: str) -> None:
+        with self._lock:
+            assignee_dict = self.tree.get(proj_slug, {})
+            all_tickets = [t for statuses in assignee_dict.values() for tickets in statuses.values() for t in tickets]
+        self._save_cache(proj_slug, all_tickets)
 
     def get_tree(self) -> Tree:
         with self._lock:
@@ -417,6 +484,7 @@ class NotionFS(fuse.Operations):  # pyright: ignore[reportMissingTypeStubs]
     def __init__(self, cache: NotionCache) -> None:
         self.cache = cache
         self._rendered: dict[str, bytes] = {}
+        self._refresh_buf: dict[str, bytes] = {}
 
     def _parse_path(self, path: str) -> list[str]:
         parts = [p for p in path.strip("/").split("/") if p]
@@ -430,10 +498,13 @@ class NotionFS(fuse.Operations):  # pyright: ignore[reportMissingTypeStubs]
                 return t
         return None
 
-    def _render_ticket(self, ticket: Ticket) -> bytes:
+    def _render_ticket(self, ticket: Ticket, proj_slug: str | None = None) -> bytes:
         key = ticket.page_id
         if key not in self._rendered:
-            self._rendered[key] = ticket.render()
+            content, fetched = ticket.render()
+            self._rendered[key] = content
+            if fetched and proj_slug:
+                self.cache.save_project_cache(proj_slug)
         return self._rendered[key]
 
     def getattr(self, path: str, fh: int | None = None) -> dict[str, int | float]:
@@ -507,18 +578,22 @@ class NotionFS(fuse.Operations):  # pyright: ignore[reportMissingTypeStubs]
 
         if len(parts) == 2 and parts[1] == ".refresh":
             proj = parts[0]
-            slug_map = self.cache.get_slug_map()
-            proj_display = slug_map.get(proj, proj)
-            count = self.cache.refresh(proj_display)
-            self._rendered.clear()
-            msg = f"Refreshed {proj_display}: {count} tickets\n"
-            data = msg.encode("utf-8")
+            # Only trigger refresh on first read; subsequent reads
+            # (from kernel probing past st_size) serve from buffer.
+            if offset == 0:
+                slug_map = self.cache.get_slug_map()
+                proj_display = slug_map.get(proj, proj)
+                count = self.cache.refresh(proj_display)
+                self._rendered.clear()
+                msg = f"Refreshed {proj_display}: {count} tickets\n"
+                self._refresh_buf[proj] = msg.encode("utf-8")
+            data = self._refresh_buf.get(proj, b"")
             return data[offset : offset + size]
 
         if len(parts) == 4:
             ticket = self._find_ticket(parts[0], parts[1], parts[2], parts[3])
             if ticket:
-                content = self._render_ticket(ticket)
+                content = self._render_ticket(ticket, proj_slug=parts[0])
                 return content[offset : offset + size]
 
         raise fuse.FuseOSError(errno.ENOENT)
@@ -593,6 +668,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Notion FUSE filesystem")
     parser.add_argument("mountpoint", help="Directory to mount the filesystem on")
     parser.add_argument("--config", dest="config_path", default=None, help="Path to notion.yaml config")
+    parser.add_argument("--cache-dir", dest="cache_dir", default="./cache", help="Directory for JSON cache files (default: ./cache)")
     args = parser.parse_args()
 
     _token = os.environ.get("NOTION_TOKEN", "")
@@ -605,10 +681,16 @@ def main() -> None:
         print("Error: no projects configured", file=sys.stderr)
         sys.exit(1)
 
-    cache = NotionCache(config)
-    print("Loading tickets from Notion...", file=sys.stderr)
-    total = cache.refresh()
-    print(f"Loaded {total} tickets", file=sys.stderr)
+    cache_dir = Path(args.cache_dir)
+    cache = NotionCache(config, cache_dir=cache_dir)
+
+    total = cache.load_from_disk()
+    if total > 0:
+        print(f"Loaded {total} tickets from disk cache", file=sys.stderr)
+    else:
+        print("No disk cache found, fetching from Notion...", file=sys.stderr)
+        total = cache.refresh()
+        print(f"Loaded {total} tickets", file=sys.stderr)
 
     print(f"Mounted at {args.mountpoint}", file=sys.stderr)
     fuse.FUSE(  # pyright: ignore[reportMissingTypeStubs]
