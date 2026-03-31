@@ -147,16 +147,21 @@ Env: `NOTION_TOKEN` (required).
 
 ```toml
 [dependencies]
-fuser = "0.15"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+fuser = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
+unicode-normalization = "0.1"
+libc = "0.2"
+ctrlc = "3"
 ```
 
-7 direct dependencies. No async runtime.
+10 direct dependencies. No async runtime. fuser 0.17 enables concurrent FUSE
+dispatch via `n_threads` + `clone_fd`. reqwest uses rustls (no system OpenSSL).
+ctrlc enables clean unmount on Ctrl+C via spawn_mount2.
 
 ## Error Handling
 

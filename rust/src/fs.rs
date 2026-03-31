@@ -35,6 +35,8 @@ pub struct NotionFS {
     cache: Arc<NotionCache>,
     rendered: Mutex<HashMap<String, Vec<u8>>>,
     refresh_buf: Mutex<HashMap<String, Vec<u8>>>,
+    // Grows monotonically — bounded by dataset size (~4 entries per ticket).
+    // Not cleaned on refresh since inodes must remain stable for open file handles.
     ino_to_path: RwLock<HashMap<INodeNo, PathBuf>>,
     uid: u32,
     gid: u32,
@@ -130,7 +132,7 @@ impl NotionFS {
         match parts.len() {
             0 => true,
             1 => true,
-            2 => parts[1] != ".refresh",
+            2 => parts[1] != ".refresh", // len of parts could be < 1
             3 => true,
             _ => false,
         }

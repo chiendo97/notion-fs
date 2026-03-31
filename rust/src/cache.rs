@@ -208,7 +208,10 @@ impl NotionCache {
             refreshed_trees.insert(proj_slug, (proj_name.clone(), proj_tree, tickets));
         }
 
-        // Swap under write lock
+        // IMPORTANT: read locks below are acquired and dropped (via Arc::clone)
+        // before the write locks at the end of this block. Do not extend the
+        // read lock scope past the clone — RwLock is not reentrant and holding
+        // a read lock while acquiring a write lock will deadlock.
         let total;
         {
             let old_tree = self.tree.read().unwrap().clone();

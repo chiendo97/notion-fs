@@ -176,8 +176,11 @@ fn read_unique_id(props: &Value) -> String {
         for (_key, val) in obj {
             if val["type"].as_str() == Some("unique_id") {
                 let prefix = val["unique_id"]["prefix"].as_str().unwrap_or("");
-                let number = val["unique_id"]["number"].as_u64().unwrap_or(0);
-                return format!("{}-{}", prefix, number);
+                if !prefix.is_empty() {
+                    if let Some(number) = val["unique_id"]["number"].as_u64() {
+                        return format!("{}-{}", prefix, number);
+                    }
+                }
             }
         }
     }
