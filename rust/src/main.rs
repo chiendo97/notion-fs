@@ -105,6 +105,8 @@ fn main() {
     let mut config = fuser::Config::default();
     config.n_threads = Some(4);
     config.clone_fd = true;
+    // fuser unmounts cleanly on Ctrl+C / normal exit.
+    // Only kill -9 leaves a stale mount (use fusermount -u to clean up).
 
     fuser::mount2(fs, &cli.mountpoint, &config).unwrap_or_else(|e| {
         eprintln!("Error mounting filesystem: {}", e);
