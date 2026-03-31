@@ -34,6 +34,7 @@ impl NotionClient {
     pub fn query_database(
         &self,
         database_id: &str,
+        on_page: Option<&dyn Fn(usize)>,
     ) -> Result<Vec<Value>, reqwest::Error> {
         let url = format!("{}/databases/{}/query", NOTION_API_URL, database_id);
         let mut results: Vec<Value> = Vec::new();
@@ -60,6 +61,10 @@ impl NotionClient {
 
             if let Some(page_results) = data["results"].as_array() {
                 results.extend(page_results.iter().cloned());
+            }
+
+            if let Some(cb) = on_page {
+                cb(results.len());
             }
 
             let has_more = data["has_more"].as_bool().unwrap_or(false);

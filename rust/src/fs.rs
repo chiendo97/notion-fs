@@ -377,16 +377,35 @@ impl Filesystem for NotionFS {
                     .cloned()
                     .unwrap_or_else(|| proj_slug.clone());
 
-                let pb = ProgressBar::new_spinner();
+                // Estimate total from current cache for progress bar
+                let estimated_total = {
+                    let tree = self.cache.get_tree();
+                    tree.get(proj_slug.as_str())
+                        .map(|a| {
+                            a.values()
+                                .flat_map(|s| s.values().map(|v| v.len()))
+                                .sum::<usize>()
+                        })
+                        .unwrap_or(0) as u64
+                };
+
+                let pb = ProgressBar::new(estimated_total);
                 pb.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner:.green} {msg}")
-                        .unwrap(),
+                    ProgressStyle::default_bar()
+                        .template("{spinner:.green} {msg} [{bar:30.cyan/dim}] {pos}/{len} tickets ({eta})")
+                        .unwrap()
+                        .progress_chars("=> "),
                 );
-                pb.set_message(format!("Refreshing {}...", display_name));
+                pb.set_message(format!("Refreshing {}", display_name));
                 pb.enable_steady_tick(Duration::from_millis(100));
 
-                let count = self.cache.refresh(Some(&display_name));
+                let pb_ref = &pb;
+                let count = self.cache.refresh(
+                    Some(&display_name),
+                    Some(&|tickets_so_far| {
+                        pb_ref.set_position(tickets_so_far as u64);
+                    }),
+                );
 
                 pb.finish_and_clear();
                 let msg = format!("Refreshed {}: {} tickets\n", display_name, count);

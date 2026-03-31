@@ -86,15 +86,18 @@ fn main() {
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::default_spinner()
-                .template("{spinner:.green} {msg}")
+                .template("{spinner:.green} {msg} {pos} tickets")
                 .unwrap(),
         );
         pb.set_message("Fetching from Notion...");
         pb.enable_steady_tick(Duration::from_millis(100));
 
-        let total = cache.refresh(None);
+        let pb_ref = &pb;
+        let total = cache.refresh(None, Some(&|tickets_so_far| {
+            pb_ref.set_position(tickets_so_far as u64);
+        }));
 
-        pb.finish_with_message(format!("Loaded {} tickets", total));
+        pb.finish_and_clear();
         eprintln!("Loaded {} tickets", total);
     }
 

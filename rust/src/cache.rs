@@ -168,7 +168,11 @@ impl NotionCache {
     /// Query Notion API and rebuild the tree. If `project` is given, only refresh
     /// that project (by display name); otherwise refresh all configured projects.
     /// Returns total ticket count across all projects in the tree.
-    pub fn refresh(&self, project: Option<&str>) -> usize {
+    pub fn refresh(
+        &self,
+        project: Option<&str>,
+        on_progress: Option<&dyn Fn(usize)>,
+    ) -> usize {
         // Determine which projects to refresh
         let projects_to_refresh: Vec<(String, ProjectConfig)> = match project {
             Some(name) => self
@@ -192,7 +196,7 @@ impl NotionCache {
         let mut refreshed_slug_map: HashMap<String, String> = HashMap::new();
 
         for (proj_name, proj_cfg) in &projects_to_refresh {
-            let pages = match self.client.query_database(&proj_cfg.database_id) {
+            let pages = match self.client.query_database(&proj_cfg.database_id, on_progress) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
