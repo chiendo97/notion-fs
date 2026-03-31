@@ -32,12 +32,21 @@ fn path_to_ino(path: &PathBuf) -> INodeNo {
 }
 
 pub struct NotionFS {
+    /// Shared Notion data: in-memory ticket tree, API client, disk cache.
     cache: Arc<NotionCache>,
+    /// page_id -> rendered markdown bytes. Avoids re-rendering on repeated reads.
+    /// Cleared on .refresh so tickets pick up updated data.
     rendered: Mutex<HashMap<String, Vec<u8>>>,
+    /// proj_slug -> last .refresh output bytes. Buffered so the kernel's
+    /// follow-up read (probing past st_size) returns the same data.
     refresh_buf: Mutex<HashMap<String, Vec<u8>>>,
-    // Grows monotonically — bounded by dataset size (~4 entries per ticket).
-    // Not cleaned on refresh since inodes must remain stable for open file handles.
+    /// inode -> path reverse map for getattr/read (which only receive an inode).
+    /// Inodes are computed deterministically via path hash, so this map is only
+    /// needed for the reverse direction. Grows monotonically — bounded by dataset
+    /// size (~4 entries per ticket). Not cleaned on refresh since inodes must
+    /// remain stable for open file handles.
     ino_to_path: RwLock<HashMap<INodeNo, PathBuf>>,
+    /// Process uid/gid, captured at mount time for file ownership in stat results.
     uid: u32,
     gid: u32,
 }
