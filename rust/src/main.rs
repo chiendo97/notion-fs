@@ -108,11 +108,22 @@ fn main() {
     let mut config = fuser::Config::default();
     config.n_threads = Some(4);
     config.clone_fd = true;
-    // fuser unmounts cleanly on Ctrl+C / normal exit.
-    // Only kill -9 leaves a stale mount (use fusermount -u to clean up).
 
-    fuser::mount2(fs, &cli.mountpoint, &config).unwrap_or_else(|e| {
+    let session = fuser::spawn_mount2(fs, &cli.mountpoint, &config).unwrap_or_else(|e| {
         eprintln!("Error mounting filesystem: {}", e);
         std::process::exit(1);
+    });
+
+    // Wait for Ctrl+C, then unmount cleanly
+    let (tx, rx) = std::sync::mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })
+    .expect("Error setting Ctrl+C handler");
+
+    rx.recv().ok();
+    eprintln!("\nUnmounting...");
+    session.umount_and_join().unwrap_or_else(|e| {
+        eprintln!("Error unmounting: {}", e);
     });
 }
