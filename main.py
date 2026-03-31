@@ -16,17 +16,17 @@ import stat
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-import ctypes
-import ctypes.util
-import glob as globmod
 
-# fusepy uses ctypes.util.find_library("fuse") which fails on NixOS.
-# Patch it to find libfuse from known paths (fusepy needs libfuse2, not 3).
+import ctypes.util
+
+# fusepy uses ctypes.util.find_library("fuse") which fails with uv-managed
+# Python on NixOS. Patch to check nix-ld and nix store paths.
 _orig_find_library = ctypes.util.find_library
 
 
@@ -35,12 +35,8 @@ def _patched_find_library(name: str) -> str | None:
     if result is not None:
         return result
     if name == "fuse":
-        candidates = [
-            "/run/current-system/sw/share/nix-ld/lib/libfuse.so",
-            "/usr/lib/libfuse.so",
-            "/usr/lib64/libfuse.so",
-        ]
-        # Search nix store for libfuse2
+        import glob as globmod
+        candidates = ["/run/current-system/sw/share/nix-ld/lib/libfuse.so"]
         candidates.extend(globmod.glob("/nix/store/*/lib/libfuse.so"))
         for path in candidates:
             if os.path.exists(path):
@@ -310,7 +306,12 @@ class Ticket(BaseModel):
 
 
 def slugify(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    # NFD decompose then strip combining marks (accents/tones)
+    nfkd = unicodedata.normalize("NFKD", name)
+    ascii_name = "".join(c for c in nfkd if not unicodedata.combining(c))
+    # Handle Vietnamese đ/Đ which NFD doesn't decompose
+    ascii_name = ascii_name.replace("đ", "d").replace("Đ", "D")
+    return re.sub(r"[^a-z0-9]+", "-", ascii_name.lower()).strip("-")
 
 
 # =============================================================================
