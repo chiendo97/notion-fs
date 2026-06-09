@@ -1,12 +1,12 @@
-# notion-fs Rust Rewrite Design
+# notion-fs Rust Design
 
 ## Goal
 
-Rewrite the Python notion-fs FUSE filesystem in Rust to improve performance, distribution (single static binary), maintainability (eliminate fusepy/libfuse2/NixOS workarounds), and as a Rust learning exercise.
+Implement notion-fs as a Rust FUSE filesystem to improve performance, distribution, maintainability, and provide a focused Rust learning exercise.
 
 ## Scope
 
-1:1 feature clone of the current Python implementation. Same directory layout, same config format, same CLI interface, same lazy-loading behavior. Linux only.
+Read-only Notion ticket filesystem with the existing directory layout, config format, CLI interface, and lazy-loading behavior. Linux only.
 
 ## Architecture
 
@@ -82,7 +82,7 @@ All synchronous -- no async runtime. `fuser` callbacks call the Notion client di
 
 ## Ticket Rendering
 
-Same markdown format as Python version:
+Markdown format:
 
 ```markdown
 ---
@@ -184,4 +184,4 @@ Produces a single static binary (with musl: `cargo build --release --target x86_
 - Write support (status changes via filesystem)
 - Async runtime
 - Background auto-refresh
-- Epics support (not implemented in Python version's FUSE layer either)
+- Epics support

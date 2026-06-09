@@ -1,7 +1,0 @@
-[project]
-name = "notion-fs"
-version = "0.1.0"
-description = "FUSE filesystem that presents Notion tickets as browsable markdown files"
-readme = "README.md"
-requires-python = ">=3.12"
-dependencies = ["fusepy", "pyyaml", "certifi", "pydantic"]

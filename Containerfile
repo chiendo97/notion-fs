@@ -1,17 +1,32 @@
-FROM python:3.12-slim
+FROM rust:1-slim-bookworm AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends fuse3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libfuse3-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    fuse3 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Allow non-root FUSE mounts
 RUN sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
 
 WORKDIR /app
 
-# Install Python deps from PEP 723 inline metadata
-RUN pip install --no-cache-dir fusepy pyyaml certifi pydantic
-
-COPY main.py .
+COPY --from=builder /build/target/release/notion-fs /usr/local/bin/notion-fs
 
 RUN mkdir -p /mnt/notion
 
-ENTRYPOINT ["python", "main.py", "/mnt/notion"]
+ENTRYPOINT ["notion-fs", "/mnt/notion", "--config", "/config/notion.yaml"]

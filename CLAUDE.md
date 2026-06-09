@@ -5,8 +5,12 @@ FUSE filesystem that presents Notion tickets as markdown files: `project/assigne
 ## Running
 
 ```bash
-# Local (needs libfuse2)
-uv run main.py ./mnt --config /path/to/notion.yaml
+# Local (needs FUSE and NOTION_TOKEN)
+NOTION_TOKEN=ntn_... cargo run -- ./mnt --config ./config/notion.yaml
+
+# Release binary
+cargo build --release
+NOTION_TOKEN=ntn_... ./target/release/notion-fs ./mnt --config ./config/notion.yaml
 
 # Podman
 podman run --rm -it --device /dev/fuse --cap-add SYS_ADMIN \
@@ -16,19 +20,20 @@ podman run --rm -it --device /dev/fuse --cap-add SYS_ADMIN \
 
 ## Lessons Learned
 
-### NixOS + fusepy
+### FUSE Runtime
 
-- `ctypes.util.find_library("fuse")` returns `None` on NixOS even with nix-ld. Python's ctypes doesn't use the nix-ld interceptor. We monkey-patch `find_library` and glob the nix store for the `.so`.
-- fusepy needs **libfuse2**, not libfuse3. Loading libfuse3 makes it mount but all operations return "Operation not supported" (different ABI).
+- `fuser` uses the system FUSE runtime. The container image installs `fuse3`.
+- Container runs still need `--device /dev/fuse`, `--cap-add SYS_ADMIN`, and a shared bind mount for the host to see the mounted tree.
 
 ### Notion API Performance
 
 - With 1600+ tickets across multiple databases, initial metadata-only load takes ~45 seconds.
 - Fetching page content (descriptions) per ticket on initial load is not viable. Descriptions must be lazy-loaded on `cat`, not on mount.
 
-### fusepy Error Handling
+### FUSE Error Handling
 
-- fusepy expects `raise fuse.FuseOSError(errno.ENOENT)`, not `return -errno.ENOENT`. The return-negative-int pattern is from the C FUSE API, not the Python wrapper. The error message ("'int' object has no attribute 'items'") is misleading.
+- Return `libc` errno values from FUSE callbacks and keep Notion API failures contained to `EIO` for the affected read.
+- Keep write-like operations explicitly read-only with `EROFS`.
 
 ### FUSE st_size Gotchas
 
